@@ -1,0 +1,20 @@
+{
+  "name": "x402-web-scraper",
+  "compatibility_date": "2026-01-28",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "main": "src/index.ts",
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "vars": {
+    "SERVER_ADDRESS": "0x34D3eD2c5Fc6D6A0F25d1Aad77193a8AA88A52b5"
+  },
+  "routes": [
+    {
+      "pattern": "scraper.camelai.io",
+      "custom_domain": true
+    }
+  ]
+}
