@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
-import { describeRoute, openAPIRouteHandler } from "hono-openapi";
+import { extractParams } from "x402-ai";
+import { openapiFromMiddleware } from "x402-openapi";
 import puppeteer from "@cloudflare/puppeteer";
 import type { Page } from "@cloudflare/puppeteer";
 
@@ -104,110 +105,69 @@ async function extractPageContent(page: Page): Promise<{ title: string; html: st
   });
 }
 
-// --- OpenAPI spec ---
+const SYSTEM_PROMPT = `You are a parameter extractor for a web scraping and crawling service.
+Extract the following from the user's message and return JSON:
+- "url": the URL to scrape or crawl (required)
+- "action": either "scrape" (single page) or "crawl" (follow links). Default "scrape". (optional)
+- "format": output format - "text", "html", or "markdown". Default "text". (optional)
+- "depth": crawl depth 1-3 for crawl action. Default 1. (optional)
 
-app.get("/.well-known/openapi.json", openAPIRouteHandler(app, {
-  documentation: {
-    info: {
-      title: "x402 Web Scraper Service",
-      description: "Scrape single pages or crawl websites, returning content as markdown or JSON. Pay-per-use via x402 protocol on Base mainnet.",
-      version: "1.0.0",
+If the user mentions crawling, spidering, or following links, set action to "crawl".
+Otherwise default to "scrape".
+
+Return ONLY valid JSON, no explanation.
+Examples:
+- {"url": "https://example.com"}
+- {"url": "https://example.com", "action": "crawl", "depth": 2}
+- {"url": "https://example.com", "format": "markdown"}`;
+
+const ROUTES = {
+  "POST /": {
+    accepts: [{ scheme: "exact", price: "$0.01", network: "eip155:8453", payTo: "0x0" as `0x${string}` }],
+    description: "Scrape a single page or crawl a website, returning content as text, HTML, or markdown. Send {\"input\": \"your request\"}",
+    mimeType: "application/json",
+    extensions: {
+      bazaar: {
+        info: {
+          input: {
+            type: "http",
+            method: "POST",
+            bodyType: "json",
+            body: {
+              input: { type: "string", description: "Describe what you want to scrape or crawl", required: true },
+            },
+          },
+          output: { type: "json" },
+        },
+        schema: {
+          properties: {
+            input: {
+              properties: { method: { type: "string", enum: ["POST"] } },
+              required: ["method"],
+            },
+          },
+        },
+      },
     },
-    servers: [{ url: "https://scraper.camelai.io" }],
   },
-}));
-
-// --- Payment middleware ---
+};
 
 app.use(
-  cdpPaymentMiddleware(
-    (env) => ({
-      "GET /scrape": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.01",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description: "Scrape a single URL and return its content as markdown or JSON",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              queryParams: {
-                url: {
-                  type: "string",
-                  description: "URL to scrape",
-                  required: true,
-                },
-                format: {
-                  type: "string",
-                  description: "Output format: markdown or json (default: markdown)",
-                  required: false,
-                },
-              },
-            },
-          },
-        },
-      },
-      "GET /crawl": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.05",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description:
-          "Crawl a website following links up to a specified depth, returning structured content",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              queryParams: {
-                url: {
-                  type: "string",
-                  description: "Starting URL to crawl",
-                  required: true,
-                },
-                format: {
-                  type: "string",
-                  description: "Output format: markdown or json (default: json)",
-                  required: false,
-                },
-                depth: {
-                  type: "number",
-                  description: "Max crawl depth 1-3 (default: 1)",
-                  required: false,
-                },
-              },
-            },
-          },
-        },
-      },
-    })
-  )
+  cdpPaymentMiddleware((env) => ({
+    "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
+  }))
 );
 
-// --- GET /scrape ---
+app.post("/", async (c) => {
+  const body = await c.req.json<{ input?: string }>();
+  if (!body?.input) {
+    return c.json({ error: "Missing 'input' field" }, 400);
+  }
 
-app.get("/scrape", describeRoute({
-  description: "Scrape a single URL and return content as markdown or JSON. Requires x402 payment ($0.01).",
-  responses: {
-    200: { description: "Scraped content", content: { "text/markdown": { schema: { type: "string" } }, "application/json": { schema: { type: "object" } } } },
-    400: { description: "Invalid or missing URL" },
-    402: { description: "Payment required" },
-    500: { description: "Scrape failed" },
-  },
-}), async (c) => {
-  const url = c.req.query("url");
+  const params = await extractParams(c.env.CF_GATEWAY_TOKEN, SYSTEM_PROMPT, body.input);
+  const url = params.url as string;
   if (!url) {
-    return c.json({ error: "Missing required query parameter: url" }, 400);
+    return c.json({ error: "Could not determine URL to scrape" }, 400);
   }
 
   try {
@@ -216,9 +176,111 @@ app.get("/scrape", describeRoute({
     return c.json({ error: "Invalid URL" }, 400);
   }
 
-  const format = (c.req.query("format") || "markdown").toLowerCase();
-  if (format !== "markdown" && format !== "json") {
-    return c.json({ error: "Format must be markdown or json" }, 400);
+  const action = ((params.action as string) || "scrape").toLowerCase();
+  const format = ((params.format as string) || "text").toLowerCase();
+
+  if (action === "crawl") {
+    // --- Crawl ---
+    if (format !== "text" && format !== "html" && format !== "markdown") {
+      return c.json({ error: "Format must be text, html, or markdown" }, 400);
+    }
+
+    const depth = Math.min(Math.max(parseInt(String(params.depth || "1"), 10) || 1, 1), 3);
+
+    let browser;
+    try {
+      browser = await puppeteer.launch(c.env.BROWSER);
+      const page = await browser.newPage();
+      await page.setViewport({ width: 1280, height: 720 });
+
+      const visited = new Set<string>();
+      const pages: Array<{
+        url: string;
+        title: string;
+        content: string;
+        depth: number;
+        links: string[];
+      }> = [];
+
+      // BFS crawl
+      let queue: Array<{ url: string; depth: number }> = [{ url, depth: 0 }];
+
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+
+        if (visited.has(current.url) || current.depth > depth) continue;
+        visited.add(current.url);
+
+        try {
+          await page.goto(current.url, { waitUntil: "networkidle0", timeout: 20000 });
+          const { title, html } = await extractPageContent(page);
+          const markdown = htmlToMarkdown(html);
+          const links = await extractLinks(page, current.url);
+
+          pages.push({
+            url: current.url,
+            title,
+            content: markdown,
+            depth: current.depth,
+            links,
+          });
+
+          // Queue child links if we haven't reached max depth
+          if (current.depth < depth) {
+            for (const link of links.slice(0, 10)) {
+              if (!visited.has(link)) {
+                queue.push({ url: link, depth: current.depth + 1 });
+              }
+            }
+          }
+        } catch {
+          // Skip pages that fail to load
+          continue;
+        }
+
+        // Cap total pages to avoid runaway crawls
+        if (pages.length >= 20) break;
+      }
+
+      if (format === "markdown") {
+        const md = pages
+          .map(
+            (p) =>
+              `# ${p.title}\n\nURL: ${p.url}\nDepth: ${p.depth}\n\n---\n\n${p.content}`
+          )
+          .join("\n\n---\n\n");
+
+        return new Response(md, {
+          headers: { "Content-Type": "text/markdown; charset=utf-8" },
+        });
+      }
+
+      return c.json({
+        startUrl: url,
+        depth,
+        totalPages: pages.length,
+        crawledAt: new Date().toISOString(),
+        pages: pages.map((p) => ({
+          url: p.url,
+          title: p.title,
+          content: p.content,
+          depth: p.depth,
+          linksFound: p.links.length,
+        })),
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      return c.json({ error: "Crawl failed", details: message }, 500);
+    } finally {
+      if (browser) {
+        await browser.close();
+      }
+    }
+  }
+
+  // --- Scrape (default) ---
+  if (format !== "text" && format !== "html" && format !== "markdown") {
+    return c.json({ error: "Format must be text, html, or markdown" }, 400);
   }
 
   let browser;
@@ -231,22 +293,31 @@ app.get("/scrape", describeRoute({
     const { title, html } = await extractPageContent(page);
     const markdown = htmlToMarkdown(html);
 
-    if (format === "json") {
+    if (format === "html") {
       return c.json({
         url,
         title,
-        content: markdown,
+        content: html,
         scrapedAt: new Date().toISOString(),
       });
     }
 
-    // Return markdown as plain text
-    return new Response(
-      `# ${title}\n\nSource: ${url}\n\n---\n\n${markdown}`,
-      {
-        headers: { "Content-Type": "text/markdown; charset=utf-8" },
-      }
-    );
+    if (format === "markdown") {
+      return new Response(
+        `# ${title}\n\nSource: ${url}\n\n---\n\n${markdown}`,
+        {
+          headers: { "Content-Type": "text/markdown; charset=utf-8" },
+        }
+      );
+    }
+
+    // Default: text (json wrapper with markdown content)
+    return c.json({
+      url,
+      title,
+      content: markdown,
+      scrapedAt: new Date().toISOString(),
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return c.json({ error: "Scrape failed", details: message }, 500);
@@ -257,124 +328,14 @@ app.get("/scrape", describeRoute({
   }
 });
 
-// --- GET /crawl ---
+app.get("/.well-known/openapi.json", openapiFromMiddleware("x402 Web Scraper", "scraper.camelai.io", ROUTES));
 
-app.get("/crawl", describeRoute({
-  description: "Crawl a website following links up to a specified depth. Requires x402 payment ($0.05).",
-  responses: {
-    200: { description: "Crawled content from multiple pages", content: { "text/markdown": { schema: { type: "string" } }, "application/json": { schema: { type: "object" } } } },
-    400: { description: "Invalid or missing URL" },
-    402: { description: "Payment required" },
-    500: { description: "Crawl failed" },
-  },
-}), async (c) => {
-  const url = c.req.query("url");
-  if (!url) {
-    return c.json({ error: "Missing required query parameter: url" }, 400);
-  }
-
-  try {
-    new URL(url);
-  } catch {
-    return c.json({ error: "Invalid URL" }, 400);
-  }
-
-  const format = (c.req.query("format") || "json").toLowerCase();
-  if (format !== "markdown" && format !== "json") {
-    return c.json({ error: "Format must be markdown or json" }, 400);
-  }
-
-  const depth = Math.min(Math.max(parseInt(c.req.query("depth") || "1", 10) || 1, 1), 3);
-
-  let browser;
-  try {
-    browser = await puppeteer.launch(c.env.BROWSER);
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
-
-    const visited = new Set<string>();
-    const pages: Array<{
-      url: string;
-      title: string;
-      content: string;
-      depth: number;
-      links: string[];
-    }> = [];
-
-    // BFS crawl
-    let queue: Array<{ url: string; depth: number }> = [{ url, depth: 0 }];
-
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-
-      if (visited.has(current.url) || current.depth > depth) continue;
-      visited.add(current.url);
-
-      try {
-        await page.goto(current.url, { waitUntil: "networkidle0", timeout: 20000 });
-        const { title, html } = await extractPageContent(page);
-        const markdown = htmlToMarkdown(html);
-        const links = await extractLinks(page, current.url);
-
-        pages.push({
-          url: current.url,
-          title,
-          content: markdown,
-          depth: current.depth,
-          links,
-        });
-
-        // Queue child links if we haven't reached max depth
-        if (current.depth < depth) {
-          for (const link of links.slice(0, 10)) {
-            if (!visited.has(link)) {
-              queue.push({ url: link, depth: current.depth + 1 });
-            }
-          }
-        }
-      } catch {
-        // Skip pages that fail to load
-        continue;
-      }
-
-      // Cap total pages to avoid runaway crawls
-      if (pages.length >= 20) break;
-    }
-
-    if (format === "markdown") {
-      const md = pages
-        .map(
-          (p) =>
-            `# ${p.title}\n\nURL: ${p.url}\nDepth: ${p.depth}\n\n---\n\n${p.content}`
-        )
-        .join("\n\n---\n\n");
-
-      return new Response(md, {
-        headers: { "Content-Type": "text/markdown; charset=utf-8" },
-      });
-    }
-
-    return c.json({
-      startUrl: url,
-      depth,
-      totalPages: pages.length,
-      crawledAt: new Date().toISOString(),
-      pages: pages.map((p) => ({
-        url: p.url,
-        title: p.title,
-        content: p.content,
-        depth: p.depth,
-        linksFound: p.links.length,
-      })),
-    });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return c.json({ error: "Crawl failed", details: message }, 500);
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
-  }
+app.get("/", (c) => {
+  return c.json({
+    service: "x402-web-scraper",
+    description: "Scrape single pages or crawl websites. Send POST / with {\"input\": \"scrape https://example.com\"}",
+    price: "$0.01 per request (Base mainnet)",
+  });
 });
 
 export default app;
